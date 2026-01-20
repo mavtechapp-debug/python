@@ -1,8 +1,4 @@
-import io
-import json
-import re
-import gc
-import time
+import io, json, re, time, gc
 from typing import Optional, Dict, Any
 
 import requests
@@ -11,30 +7,27 @@ from PIL import Image
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
-from transformers import AutoProcessor, AutoModelForVision2Seq
 
+from transformers import AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
 
-# =========================
-# CONFIG
-# =========================
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-
-DEFAULT_CONF = 0.35  # só para referência (LMM não usa conf, mas mantemos no payload)
-REQUEST_TIMEOUT = 20  # segundos
-MAX_IMAGE_BYTES = 12 * 1024 * 1024  # 12MB, evita abuso
+REQUEST_TIMEOUT = 20
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_NEW_TOKENS = 650
 
 PROMPT = """
 You are a traffic enforcement expert.
-Analyze the FULL image (global context) and list ALL traffic violations that are VISIBLE or PLAUSIBLE.
+Analyze the FULL image and list ALL traffic violations that are VISIBLE or PLAUSIBLE.
 
 Rules:
 - Do not invent facts.
-- If you cannot confirm from a single photo, set status="inconclusive".
-- For each item, include concrete visual evidence from the image.
-- Output ONLY valid JSON. No extra text.
+- If not certain from one photo, set status="inconclusive".
+- Include concrete visual evidence.
+- Output ONLY valid JSON.
 
-Required JSON format:
+Return exactly this JSON:
 {
   "scene_summary": "short description",
   "possible_violations": [
@@ -49,171 +42,123 @@ Required JSON format:
   "notes": ["..."],
   "disclaimer": "..."
 }
-
-Use these types when applicable:
-- PHONE_WHILE_DRIVING
-- NO_HELMET
-- NO_SEATBELT
-- RUN_RED_LIGHT
-- STOP_SIGN_IGNORED
-- SPEEDING
-- ILLEGAL_PARKING
-- WRONG_WAY
-- PEDESTRIAN_CROSSWALK_VIOLATION
-- LANE_VIOLATION
-- OTHER
 """.strip()
 
-
-# =========================
-# LOAD MODEL (lazy)
-# =========================
 processor: Optional[AutoProcessor] = None
-model: Optional[AutoModelForVision2Seq] = None
-
+model: Optional[Qwen2_5_VLForConditionalGeneration] = None
 
 def ensure_model_loaded():
     global processor, model
     if processor is None:
-        processor = AutoProcessor.from_pretrained(MODEL_ID)
+        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     if model is None:
-        model = AutoModelForVision2Seq.from_pretrained(
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             MODEL_ID,
             torch_dtype=torch.float16,
             device_map="auto",
+            trust_remote_code=True
         )
 
-
-def _extract_json(text: str) -> Dict[str, Any]:
-    """
-    Extract first JSON object from model output.
-    """
+def extract_json(text: str) -> Dict[str, Any]:
     text = text.strip()
-
-    # remove ```json fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-
-    m = re.search(r"\{.*\}", text, flags=re.S)
+    m = re.search(r"\{.*\}", text, re.S)
     if not m:
-        raise ValueError("Could not find JSON object in model output.")
+        raise ValueError("JSON not found in model output")
     return json.loads(m.group(0))
 
-
-def _download_image(url: str) -> Image.Image:
-    """
-    Download image with size limit and basic content-type check.
-    """
+def download_image(url: str) -> Image.Image:
     headers = {"User-Agent": "traffic-ai/1.0"}
-    r = requests.get(url, stream=True, timeout=REQUEST_TIMEOUT, headers=headers)
+    r = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
     r.raise_for_status()
-
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "image" not in ctype:
-        # allow sometimes missing ctype, but try anyway; if it fails PIL will error
-        pass
-
-    data = b""
-    for chunk in r.iter_content(chunk_size=256 * 1024):
-        if not chunk:
-            continue
-        data += chunk
-        if len(data) > MAX_IMAGE_BYTES:
-            raise HTTPException(status_code=413, detail="Image too large (limit 12MB).")
-
+    data = r.content
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image too large (limit 12MB)")
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        return Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode image from URL.")
-    return img
+        raise HTTPException(400, "Could not decode image")
 
-
-def analyze_image_with_qwen(img: Image.Image, max_new_tokens: int = MAX_NEW_TOKENS) -> Dict[str, Any]:
+def analyze_with_qwen(image: Image.Image) -> Dict[str, Any]:
     ensure_model_loaded()
 
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image"},
-            {"type": "text", "text": PROMPT}
-        ]
-    }]
+    # Qwen2.5-VL expects messages with explicit image slots
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": PROMPT},
+            ],
+        }
+    ]
+
+    # Build text prompt
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    # Process vision inputs
+    image_inputs, video_inputs = process_vision_info(messages)
 
     inputs = processor(
-        messages=messages,
-        images=img,
-        return_tensors="pt"
-    ).to(model.device)
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+
+    # Move tensors to model device
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        generated_ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
 
-    text = processor.decode(out[0], skip_special_tokens=True)
+    # Decode only the newly generated part
+    output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
     try:
-        return _extract_json(text)
-    except Exception as e:
-        # fallback: return raw output for debugging
-        return {
-            "error": f"Model output was not valid JSON: {e}",
-            "raw_output": text
-        }
+        return extract_json(output_text)
+    except Exception:
+        return {"raw_output": output_text}
 
-
-def clear_gpu_cache():
-    """
-    "Apagar" cache: libera VRAM e memória do Python.
-    """
-    global processor, model
-
-    # Mantemos o processor (leve) e liberamos o modelo (pesado), se você quiser.
-    # Se preferir manter o modelo carregado (mais rápido), comente as 2 linhas abaixo.
-    model = None
+def clear_gpu_cache(unload_model: bool = True):
+    global model
+    if unload_model:
+        model = None
     gc.collect()
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-
-# =========================
-# FASTAPI
-# =========================
-app = FastAPI(title="Traffic Infraction Analyzer (Qwen3-VL)")
-
+app = FastAPI(title="Traffic Infraction Analyzer (Qwen2.5-VL)")
 
 class AnalyzeRequest(BaseModel):
     image_url: HttpUrl
-    max_new_tokens: Optional[int] = MAX_NEW_TOKENS
-
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "model_loaded": model is not None,
         "cuda": torch.cuda.is_available(),
+        "model_loaded": model is not None,
         "model_id": MODEL_ID
     }
-
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     started = time.time()
-    img = _download_image(str(req.image_url))
-    result = analyze_image_with_qwen(img, max_new_tokens=int(req.max_new_tokens or MAX_NEW_TOKENS))
-    result["_meta"] = {
-        "elapsed_sec": round(time.time() - started, 3),
-        "model_id": MODEL_ID,
-    }
-    return result
-
+    try:
+        img = download_image(str(req.image_url))
+        result = analyze_with_qwen(img)
+        result["_meta"] = {"elapsed_sec": round(time.time() - started, 3)}
+        return result
+    except Exception as e:
+        # devolve erro explícito pra não ficar cego no 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/clear-cache")
 def clear_cache():
-    """
-    Endpoint para "apagar": limpa cache e libera VRAM.
-    """
-    clear_gpu_cache()
-    return {"ok": True, "message": "Cache cleared and VRAM freed (model unloaded)."}
-
+    clear_gpu_cache(unload_model=True)
+    return {"ok": True, "message": "Cleared cache and unloaded model from GPU"}
