@@ -11,39 +11,60 @@ from pydantic import BaseModel, HttpUrl
 from transformers import AutoProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration
 
+# =========================
+# CONFIG
+# =========================
 MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-
 REQUEST_TIMEOUT = 25
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_NEW_TOKENS = 650
 
 PROMPT = """
-You are a traffic enforcement expert.
-Analyze the FULL image and list ALL traffic violations that are VISIBLE or PLAUSIBLE.
+Você é um especialista em fiscalização de trânsito no Brasil.
 
-Rules:
-- Do not invent facts.
-- If not certain from one photo, set status="inconclusive".
-- Include concrete visual evidence from the image.
-- Output ONLY valid JSON. No extra text.
+Analise A IMAGEM INTEIRA (contexto completo) e liste TODAS as infrações de trânsito que estejam VISÍVEIS ou POSSÍVEIS de serem inferidas a partir da imagem.
 
-Return exactly this JSON:
+REGRAS OBRIGATÓRIAS:
+- Responda SOMENTE em PORTUGUÊS (Brasil).
+- Não invente fatos.
+- Se a infração não puder ser confirmada com certeza a partir de uma única imagem, marque o status como "inconclusiva".
+- Para cada infração, descreva claramente as evidências visuais observadas na imagem.
+- Se faltar informação (ex: movimento, tempo, sinalização fora do enquadramento), informe em "informacoes_faltantes".
+- Retorne APENAS um JSON válido, sem texto fora do JSON.
+
+FORMATO EXATO DO JSON:
 {
-  "scene_summary": "short description",
-  "possible_violations": [
+  "resumo_cena": "descrição curta da cena",
+  "infracoes_possiveis": [
     {
-      "type": "STRING_ENUM",
-      "status": "likely|possible|inconclusive|none",
-      "confidence": 0.0,
-      "evidence": ["..."],
-      "missing_info": ["..."]
+      "tipo": "ENUM_STRING",
+      "status": "provavel|possivel|inconclusiva|nenhuma",
+      "confianca": 0.0,
+      "evidencias": ["..."],
+      "informacoes_faltantes": ["..."]
     }
   ],
-  "notes": ["..."],
-  "disclaimer": "..."
+  "observacoes": ["..."],
+  "aviso_legal": "string"
 }
+
+UTILIZE ESTES TIPOS (quando aplicável):
+- ESTACIONAMENTO_IRREGULAR
+- USO_CELULAR_AO_VOLANTE
+- SEM_CAPACETE
+- SEM_CINTO_DE_SEGURANCA
+- AVANCO_SINAL_VERMELHO
+- DESRESPEITO_PARE
+- EXCESSO_VELOCIDADE
+- CONTRAMAO
+- FAIXA_PEDESTRE
+- FAIXA_OU_PISTA_IRREGULAR
+- OUTRA
 """.strip()
 
+# =========================
+# MODEL (lazy load)
+# =========================
 processor: Optional[AutoProcessor] = None
 model: Optional[Qwen2_5_VLForConditionalGeneration] = None
 
@@ -61,35 +82,59 @@ def ensure_model_loaded():
         )
 
 
-def extract_json(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise ValueError("JSON not found in model output")
-    return json.loads(m.group(0))
+def extract_json_anywhere(text: str) -> Dict[str, Any]:
+    """
+    Extrai o PRIMEIRO objeto JSON válido do texto, mesmo se vier com:
+    - logs "system/user/assistant"
+    - bloco ```json ... ```
+    """
+    if not text:
+        raise ValueError("Saída do modelo vazia.")
+
+    # remove fences ```json
+    text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE)
+
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("Não encontrei '{' para iniciar um JSON na saída do modelo.")
+
+    depth = 0
+    end = None
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end is None:
+        raise ValueError("Não encontrei o final do JSON (chaves desbalanceadas).")
+
+    candidate = text[start:end].strip()
+    return json.loads(candidate)
 
 
 def download_image(url: str) -> Image.Image:
     headers = {"User-Agent": "traffic-ai/1.0"}
     r = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
     r.raise_for_status()
-    data = r.content
 
+    data = r.content
     if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Image too large (limit 12MB)")
+        raise HTTPException(status_code=413, detail="Imagem muito grande (limite 12MB).")
 
     try:
         return Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode image")
+        raise HTTPException(status_code=400, detail="Não foi possível decodificar a imagem.")
 
 
 def analyze_with_qwen(image: Image.Image) -> Dict[str, Any]:
     """
-    Qwen2.5-VL: use apply_chat_template to insert the image token correctly,
-    then pass text + images to processor.
+    Qwen2.5-VL: monta o prompt com apply_chat_template e passa images=[PIL].
     """
     ensure_model_loaded()
 
@@ -109,7 +154,7 @@ def analyze_with_qwen(image: Image.Image) -> Dict[str, Any]:
         add_generation_prompt=True
     )
     if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("apply_chat_template returned empty/invalid text")
+        raise RuntimeError("apply_chat_template retornou texto inválido/vazio.")
 
     inputs = processor(
         text=[text],
@@ -127,12 +172,16 @@ def analyze_with_qwen(image: Image.Image) -> Dict[str, Any]:
     output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
     try:
-        return extract_json(output_text)
+        return extract_json_anywhere(output_text)
     except Exception:
-        return {"raw_output": output_text}
+        # Se por algum motivo não vier JSON, devolve bruto pra debug
+        return {"erro": "Modelo não retornou JSON válido", "raw_output": output_text}
 
 
 def clear_gpu_cache(unload_model: bool = True):
+    """
+    "Apagar": limpa VRAM e (opcionalmente) descarrega o modelo.
+    """
     global model
     if unload_model:
         model = None
@@ -142,7 +191,10 @@ def clear_gpu_cache(unload_model: bool = True):
         torch.cuda.ipc_collect()
 
 
-app = FastAPI(title="Traffic Infraction Analyzer (Qwen2.5-VL)")
+# =========================
+# API
+# =========================
+app = FastAPI(title="Analisador de Infracoes (Qwen2.5-VL)")
 
 class AnalyzeRequest(BaseModel):
     image_url: HttpUrl
@@ -153,7 +205,7 @@ def health():
     return {
         "ok": True,
         "cuda": torch.cuda.is_available(),
-        "model_loaded": model is not None,
+        "modelo_carregado": model is not None,
         "model_id": MODEL_ID,
     }
 
@@ -165,18 +217,17 @@ def analyze(req: AnalyzeRequest):
         img = download_image(str(req.image_url))
         result = analyze_with_qwen(img)
         result["_meta"] = {
-            "elapsed_sec": round(time.time() - started, 3),
+            "tempo_segundos": round(time.time() - started, 3),
             "model_id": MODEL_ID,
         }
         return result
     except HTTPException:
         raise
     except Exception as e:
-        # Mostra o erro real (não fica cego no "Internal Server Error")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/clear-cache")
 def clear_cache():
     clear_gpu_cache(unload_model=True)
-    return {"ok": True, "message": "Cache cleared and model unloaded from GPU"}
+    return {"ok": True, "mensagem": "Cache limpo e modelo descarregado da GPU (VRAM liberada)."}
