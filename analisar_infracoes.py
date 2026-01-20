@@ -17,7 +17,8 @@ from transformers import AutoProcessor, AutoModelForVision2Seq
 # =========================
 # CONFIG
 # =========================
-MODEL_ID = "Qwen/Qwen3-VL-7B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+
 DEFAULT_CONF = 0.35  # só para referência (LMM não usa conf, mas mantemos no payload)
 REQUEST_TIMEOUT = 20  # segundos
 MAX_IMAGE_BYTES = 12 * 1024 * 1024  # 12MB, evita abuso
@@ -215,3 +216,4 @@ def clear_cache():
     """
     clear_gpu_cache()
     return {"ok": True, "message": "Cache cleared and VRAM freed (model unloaded)."}
+
